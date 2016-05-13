@@ -54,7 +54,7 @@ class TargetType(object):
     BINARY = 'Binary'
 
 def lines_to_csv_chunk(data, header):
-    return ''.join(chain([header,], data))
+    return ''.join(chain((header,), data))
 
 def to_csv_chunk(data, fieldnames):
     # otherwise we make an async request
@@ -100,10 +100,13 @@ class BatchGenerator(object):
         sep = self.sep
 
         # handle unix tabs
+        t0 = time()
         with self.open() as csvfile:
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(csvfile.read(1024).decode('latin-1'))
+        print('sniff  took {}'.format(time() - t0))
 
+        t0 = time()
         if sep is not None:
             # if fixed sep check if we have at least one occurrence.
             with self.open() as fd:
@@ -123,27 +126,30 @@ class BatchGenerator(object):
         if sep is None:
             sep = dialect.delimiter
 
-        csvfile = codecs.getreader('latin-1')(self.open())
+        print('sep  took {}'.format(time() - t0))
+
+        csvfile = self.open()
         #reader = csv.reader(csvfile, dialect, delimiter=sep)
         reader = iter(csvfile)
-        header = next(reader)
+        header = next(reader).decode('latin1')
         fieldnames = [c.strip() for c in header.split(sep)]
 
-        batch_num = None
-        _chunk = None
-        for batch_num, chunk in enumerate(c for c in islice(iter_chunks(reader,
-                                                                      self.chunksize), 100) for i in range(4)):
-            if batch_num == 0:
-                self._ui.debug('input head: {}'.format(pformat(chunk[:50])))
-
-            rows_read += len(chunk)
-            if _chunk is None:
+        batch_num = 0
+        chunk = []
+        t0 = time()
+        for line in reader:
+            chunk.append(line.decode('latin1'))
+            rows_read += 1
+            if len(chunk) > self.chunksize:
                 chunk = lines_to_csv_chunk(chunk, header)
-            else:
-                chunk = _chunk
-            yield Batch(rows_read, fieldnames, chunk, self.rty_cnt)
+                yield Batch(rows_read, fieldnames, chunk, self.rty_cnt)
+                chunk = []
         if batch_num is None:
             raise ValueError("Input file '{}' is empty.".format(self.dataset))
+        if chunk:
+            chunk = lines_to_csv_chunk(chunk, header)
+            yield Batch(rows_read, fieldnames, chunk, self.rty_cnt)
+        print('chunking  took {}'.format(time() - t0))
 
 
 def peek_row(dataset, delimiter, ui):
@@ -700,10 +706,12 @@ def run_batch_predictions(base_url, base_headers, user, pwd,
         queue = MultiprocessingGeneratorBackedQueue(concurrent * 2, ui)
         shovel = Shovel(ctx, queue, ui)
         print('## GOGOGO')
-        #shovel.go()
-        shovel.all()
+        shovel.go()
+        t2 = time()
+        #shovel.all()
         ui.info('shoveling complete | total time elapsed {}s'
-                    .format(time() - t1))
+                    .format(time() - t2))
+        #sys.exit()
         work_unit_gen = WorkUnitGenerator(queue,
                                           endpoint,
                                           headers=base_headers,
