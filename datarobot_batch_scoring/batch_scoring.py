@@ -14,9 +14,14 @@ import shelve
 import sys
 import threading
 import hashlib
+import queue
 from functools import partial, reduce
+from itertools import chain, islice
 from pprint import pformat
 from time import time
+from time import sleep
+from multiprocessing import Queue
+from multiprocessing import Process
 
 import requests
 import six
@@ -41,10 +46,27 @@ class ShelveError(Exception):
 Batch = collections.namedtuple('Batch', 'id fieldnames data rty_cnt')
 Prediction = collections.namedtuple('Prediction', 'fieldnames data')
 
+SENTINEL = Batch(-1, None, '', -1)
+
 
 class TargetType(object):
     REGRESSION = 'Regression'
     BINARY = 'Binary'
+
+def lines_to_csv_chunk(data, header):
+    return ''.join(chain([header,], data))
+
+def to_csv_chunk(data, fieldnames):
+    # otherwise we make an async request
+    if six.PY3:
+        out = io.StringIO()
+    else:
+        out = io.BytesIO()
+    writer = csv.writer(out)
+    writer.writerow(fieldnames)
+    writer.writerows(data)
+    data = out.getvalue().encode('latin-1')
+    return data
 
 
 class BatchGenerator(object):
@@ -102,18 +124,24 @@ class BatchGenerator(object):
             sep = dialect.delimiter
 
         csvfile = codecs.getreader('latin-1')(self.open())
-        reader = csv.reader(csvfile, dialect, delimiter=sep)
+        #reader = csv.reader(csvfile, dialect, delimiter=sep)
+        reader = iter(csvfile)
         header = next(reader)
-        fieldnames = [c.strip() for c in header]
+        fieldnames = [c.strip() for c in header.split(sep)]
 
         batch_num = None
-        for batch_num, chunk in enumerate(iter_chunks(reader,
-                                                      self.chunksize)):
+        _chunk = None
+        for batch_num, chunk in enumerate(c for c in islice(iter_chunks(reader,
+                                                                      self.chunksize), 100) for i in range(4)):
             if batch_num == 0:
-                self._ui.debug('input head: {}'.format(pformat(chunk[:2])))
+                self._ui.debug('input head: {}'.format(pformat(chunk[:50])))
 
-            yield Batch(rows_read, fieldnames, chunk, self.rty_cnt)
             rows_read += len(chunk)
+            if _chunk is None:
+                chunk = lines_to_csv_chunk(chunk, header)
+            else:
+                chunk = _chunk
+            yield Batch(rows_read, fieldnames, chunk, self.rty_cnt)
         if batch_num is None:
             raise ValueError("Input file '{}' is empty.".format(self.dataset))
 
@@ -171,6 +199,86 @@ class GeneratorBackedQueue(object):
                 return False
 
 
+class MultiprocessingGeneratorBackedQueue(object):
+    """A queue that is backed by a generator.
+
+    When the queue is exhausted it repopulates from the generator.
+    """
+    def __init__(self, queue_size, ui):
+        print('queue size: {}'.format(queue_size))
+        self.n_consumed = 0
+        self.queue = Queue(queue_size)
+        self.deque = Queue(queue_size)
+        self.lock = threading.RLock()
+        self._ui = ui
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            r = self.deque.get_nowait()
+            return r
+            print('PETER GOT SOMETHING')
+        except queue.Empty:
+            try:
+                r = self.queue.get()
+                if r.id == SENTINEL.id:
+                    print('BITTER PILL')
+                    self.queue.close()
+                    raise StopIteration
+                self.n_consumed += 1
+                return r
+            except OSError:
+                raise StopIteration
+
+    def __len__(self):
+        return self.queue.qsize() + self.deque.qsize()
+
+    def next(self):
+        return self.__next__()
+
+    def push(self, batch):
+        # we retry a batch - decrement retry counter
+        batch = batch._replace(rty_cnt=batch.rty_cnt - 1)
+        try:
+            self.deque.put(batch, block=False)
+        except queue.Empty:
+            self._ui.error('Dropping {} due to backfill queue full.'.format(batch))
+
+    def has_next(self):
+        with self.lock:
+            try:
+                item = self.next()
+                self.push(item)
+                return True
+            except StopIteration:
+                return False
+
+
+class Shovel(object):
+
+    def __init__(self, ctx, queue, ui):
+        self.ctx = ctx
+        self.queue = queue
+        self._ui = ui
+
+    def _shove(self, q, ctx):
+        for batch in ctx.batch_generator():
+            q.put(batch)
+
+        q.put(SENTINEL)
+
+    def go(self):
+        self.p = Process(target=self._shove, args=(self.queue.queue, self.ctx))
+        print('#### Shoving hard...')
+        self.p.start()
+
+    def all(self):
+        self.queue.queue = Queue(0)
+        self._shove(self.queue.queue, self.ctx)
+
+
 def process_successful_request(result, batch, ctx, pred_name):
     """Process a successful request. """
     predictions = result['predictions']
@@ -181,21 +289,17 @@ def process_successful_request(result, batch, ctx, pred_name):
         if pred_name is not None and '1.0' in sorted_classes:
             sorted_classes = ['1.0']
             out_fields = ['row_id'] + [pred_name]
-        pred = [[p['row_id']+batch.id] +
+        pred = [[p['row_id'] + batch.id] +
                 [p['class_probabilities'][c] for c in sorted_classes]
                 for p in
                 sorted(predictions, key=operator.itemgetter('row_id'))]
     elif result['task'] == TargetType.REGRESSION:
-        pred = [[p['row_id']+batch.id, p['prediction']]
+        pred = [[p['row_id'] + batch.id, p['prediction']]
                 for p in
                 sorted(predictions, key=operator.itemgetter('row_id'))]
         out_fields = ['row_id', pred_name if pred_name else '']
     else:
         ValueError('task {} not supported'.format(result['task']))
-
-    if len(pred) != len(batch.data):
-        raise ValueError('Shape mismatch {}!={}'.format(
-            len(pred), len(batch.data)))
 
     ctx.checkpoint_batch(batch, out_fields, pred)
 
@@ -209,14 +313,14 @@ class WorkUnitGenerator(object):
     If a submitted async request was not successfull it gets enqueued again.
     """
 
-    def __init__(self, batches, endpoint, headers, user, api_token,
+    def __init__(self, queue, endpoint, headers, user, api_token,
                  ctx, pred_name, ui):
         self.endpoint = endpoint
         self.headers = headers
         self.user = user
         self.api_token = api_token
         self.ctx = ctx
-        self.queue = GeneratorBackedQueue(batches)
+        self.queue = queue
         self.pred_name = pred_name
         self._ui = ui
 
@@ -265,32 +369,28 @@ class WorkUnitGenerator(object):
         return self.queue.has_next()
 
     def __iter__(self):
-        for batch in self.queue:
+        for i, batch in enumerate(self.queue):
+            if batch.id == -1:  # sentinel
+                print('Got sentinel')
+                raise StopIteration()
             # if we exhaused our retries we drop the batch
             if batch.rty_cnt == 0:
                 self._ui.error('batch {} exceeded retry limit; '
                                'we lost {} records'.format(
                                    batch.id, len(batch.data)))
                 continue
-            # otherwise we make an async request
-            if six.PY3:
-                out = io.StringIO()
-            else:
-                out = io.BytesIO()
-            writer = csv.writer(out)
-            writer.writerow(batch.fieldnames)
-            writer.writerows(batch.data)
-            data = out.getvalue().encode('latin-1')
             self._ui.debug('batch {} transmitting {} bytes'
-                           .format(batch.id, len(data)))
+                           .format(batch.id, len(batch.data)))
             hook = partial(self._response_callback, batch=batch)
             yield requests.Request(
                 method='POST',
                 url=self.endpoint,
                 headers=self.headers,
-                data=data,
+                data=batch.data,
                 auth=(self.user, self.api_token),
                 hooks={'response': hook})
+            if i % 20 == 0:
+                self._ui.info('{} still in queue'.format(len(self.queue)))
 
 
 class RunContext(object):
@@ -520,16 +620,8 @@ def authorize(user, api_token, n_retry, endpoint, base_headers, batch, ui):
     while n_retry:
         ui.debug('request authorization')
         try:
-            if six.PY3:
-                out = io.StringIO()
-            else:
-                out = io.BytesIO()
-            writer = csv.writer(out)
-            writer.writerow(batch.fieldnames)
-            writer.writerow(batch.data[0])
-            data = out.getvalue()
             r = requests.post(endpoint, headers=base_headers,
-                              data=data.encode('latin-1'),
+                              data=batch.data,
                               auth=(user, api_token))
             ui.debug('authorization request response: {}|{}'
                      .format(r.status_code, r.text))
@@ -576,6 +668,7 @@ def run_batch_predictions(base_url, base_headers, user, pwd,
                           out_file, keep_cols, delimiter,
                           dataset, pred_name,
                           timeout, ui):
+    t1 = time()
     if not api_token:
         if not pwd:
             pwd = ui.getpass()
@@ -602,8 +695,16 @@ def run_batch_predictions(base_url, base_headers, user, pwd,
         n_batches_checkpointed_init = len(ctx.db['checkpoints'])
         ui.debug('number of batches checkpointed initially: {}'
                  .format(n_batches_checkpointed_init))
-        batches = ctx.batch_generator()
-        work_unit_gen = WorkUnitGenerator(batches,
+
+        # make the queue twice as big as the
+        queue = MultiprocessingGeneratorBackedQueue(concurrent * 2, ui)
+        shovel = Shovel(ctx, queue, ui)
+        print('## GOGOGO')
+        #shovel.go()
+        shovel.all()
+        ui.info('shoveling complete | total time elapsed {}s'
+                    .format(time() - t1))
+        work_unit_gen = WorkUnitGenerator(queue,
                                           endpoint,
                                           headers=base_headers,
                                           user=user,
@@ -613,17 +714,20 @@ def run_batch_predictions(base_url, base_headers, user, pwd,
                                           ui=ui)
         t0 = time()
         i = 0
-        while work_unit_gen.has_next():
-            responses = network.perform_requests(
-                work_unit_gen)
-            for r in responses:
-                i += 1
-                ui.info('{} responses sent | time elapsed {}s'
-                        .format(i, time() - t0))
 
-            ui.debug('{} items still in the queue'
-                     .format(len(work_unit_gen.queue.deque)))
+        responses = network.perform_requests(
+            work_unit_gen)
+        ui.info('done done done')
+        for r in responses:
+            i += 1
+            ui.info('{} responses sent | time elapsed {}s'
+                    .format(i, time() - t0))
 
+        ui.debug('{} items still in the queue'
+                 .format(len(work_unit_gen.queue)))
+
+        print('before wait')
+        #shovel.wait_for_bottom()
         ui.debug('list of checkpointed batches: {}'
                  .format(sorted(ctx.db['checkpoints'])))
         n_batches_checkpointed = (len(ctx.db['checkpoints']) -
@@ -640,4 +744,6 @@ def run_batch_predictions(base_url, base_headers, user, pwd,
         else:
             ui.info('scoring complete | time elapsed {}s'
                     .format(time() - t0))
+            ui.info('scoring complete | total time elapsed {}s'
+                    .format(time() - t1))
             ui.close()
