@@ -26,3 +26,6 @@ clean:
 	@rm -rf htmlcov
 	@rm -rf .coverage
 	@find . -name __pycache__ | xargs rm -rf
+
+run-bench-server:
+	uwsgi --master --wsgi-file dummy_wsgi.py --callable app --http 0.0.0.0:8002 --workers 4
